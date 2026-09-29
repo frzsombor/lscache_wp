@@ -266,6 +266,26 @@ class ESI extends Root {
 		 */
 		!defined('LSCACHE_IS_ESI') && define('LSCACHE_IS_ESI', $_GET[self::QS_ACTION]); // Reused this to ESI block ID
 
+		/**
+		 * Silent ESI blocks (e.g. nonces, which are injected directly into inline
+		 * JavaScript/JSON) must never emit the running-info HTML comment.
+		 *
+		 * Decide this as soon as the ESI request is detected: if the request is
+		 * redirected or exits before `template_include`, load_esi_block() never runs
+		 * and the comment would end up inside the inline JS string. Nonce blocks are
+		 * always silent, even if the params payload cannot be parsed.
+		 *
+		 * The params are only read here to decide comment suppression; the block
+		 * itself is still not executed until the _hash validation passes.
+		 */
+		$params = $this->_parse_esi_param();
+		if (!empty($params['_ls_silence']) || 'nonce' === LSCACHE_IS_ESI) {
+			!defined('LSCACHE_ESI_SILENCE') && define('LSCACHE_ESI_SILENCE', true);
+		}
+
+		// A redirected ESI subrequest has no usable body, never cache it as the block
+		add_filter('wp_redirect', array( $this, 'esi_redirect_nocache' ), 10, 2);
+
 		!empty($_SERVER['ESI_REFERER']) && defined('LSCWP_LOG') && self::debug('[ESI] ESI_REFERER: ' . $_SERVER['ESI_REFERER']);
 
 		/**
@@ -631,19 +651,7 @@ class ESI extends Root {
 	public function load_esi_block() {
 		$params = $this->_parse_esi_param();
 
-		/**
-		 * Silent ESI blocks (e.g. nonces, which are injected directly into inline
-		 * JavaScript/JSON) must never emit the running-info HTML comment. Set the
-		 * silence flag before the _hash validation below so that a failed or stale
-		 * block degrades to an empty string instead of corrupting the inline JS it
-		 * is embedded in.
-		 *
-		 * The params are only read here to decide comment suppression; the block
-		 * itself is still not executed until the _hash validation passes.
-		 */
-		if (!empty($params['_ls_silence'])) {
-			!defined('LSCACHE_ESI_SILENCE') && define('LSCACHE_ESI_SILENCE', true);
-		}
+		// Silence for `_ls_silence` blocks is already decided in _register_esi_actions()
 
 		/**
 		 * Validate if is a legal ESI req
@@ -653,6 +661,8 @@ class ESI extends Root {
 		$hash = $this->_gen_esi_md5($_GET);
 		if (empty($_GET['_hash']) || !is_string($_GET['_hash']) || !$hash || !hash_equals($hash, $_GET['_hash'])) {
 			self::debug('[ESI] ❌ Failed to validate _hash');
+			// Don't cache the empty block, otherwise it is served until the block TTL expires
+			Control::set_nocache('ESI Failed to validate _hash');
 			return;
 		}
 
@@ -696,6 +706,20 @@ class ESI extends Root {
 		}
 
 		do_action('litespeed_esi_load-' . LSCACHE_IS_ESI, $params);
+	}
+
+	/**
+	 * Set no cache when an ESI subrequest gets redirected (e.g. a redirect on `template_redirect`)
+	 *
+	 * @since 7.9.2
+	 * @access public
+	 * @param string $location Redirect location.
+	 * @param int    $status   HTTP status.
+	 * @return string
+	 */
+	public function esi_redirect_nocache( $location, $status ) {
+		Control::set_nocache('ESI subrequest redirected [status] ' . $status . ' [to] ' . $location);
+		return $location;
 	}
 
 	// The *_sub_* functions are helpers for the sub_* functions.
